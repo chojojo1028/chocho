@@ -1,0 +1,1468 @@
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Tuple
+import logging
+import traceback
+import platform
+import os
+from scipy import stats
+from statsmodels.tsa.seasonal import seasonal_decompose
+import calendar
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+def set_korean_font():
+    """
+    운영체제별 한글 폰트 설정 함수
+    """
+    system_name = platform.system()
+    
+    if system_name == "Windows":
+        plt.rc('font', family='Malgun Gothic')
+    elif system_name == "Darwin":  # macOS
+        plt.rc('font', family='AppleGothic')
+    else:  # Linux
+        plt.rc('font', family='NanumGothic')
+    
+    plt.rcParams['axes.unicode_minus'] = False
+
+# [기존 함수들]
+def create_label_encoders() -> Dict[str, LabelEncoder]:
+    """여행 스타일 변수들의 인코딩 순서를 미리 정의하고 검증하는 함수"""
+    try:
+        style_mapping = {
+            '여행스타일_1': ['도시', '자연', '중립'],
+            '여행스타일_2': ['당일', '숙박', '중립'],
+            '여행스타일_3': ['새로운지역', '익숙한지역', '중립'],
+            '여행스타일_4': ['비싼숙소', '저렴숙소', '중립'],
+            '여행스타일_5': ['중립', '체험활동', '휴양/휴식'],
+            '여행스타일_6': ['알려진관광지', '잘알려지지않은방문지', '중립'],
+            '여행스타일_7': ['계획여행', '상황여행', '중립'],
+            '여행스타일_8': ['사진촬영 중요', '사진촬영 중요하지 않음', '중립']
+        }
+        
+        encoders = {}
+        for col, values in style_mapping.items():
+            le = LabelEncoder()
+            le.fit(values)
+            encoded_values = le.transform(values)
+            
+            encoding_map = dict(zip(values, encoded_values))
+            logging.info(f"{col} 인코딩 매핑: {encoding_map}")
+            
+            if not all(encoded_values[i] <= encoded_values[i+1] for i in range(len(encoded_values)-1)):
+                logging.warning(f"{col} 인코딩 순서가 예상과 다릅니다: {encoding_map}")
+            
+            encoders[col] = le
+        
+        assert len(encoders) == 8, "일부 여행스타일 변수의 인코더가 누락되었습니다"
+        
+        return encoders
+    except Exception as e:
+        logging.error(f"라벨 인코더 생성 중 오류 발생: {str(e)}")
+        raise
+
+def preprocess_data(data: pd.DataFrame, label_encoders: Dict[str, LabelEncoder], 
+                   fill_value: str = '중립') -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """데이터 전처리를 수행하는 함수"""
+    processed = data.copy()
+    
+    # 1. 결측치 현황 파악
+    missing_stats = processed.isnull().sum()
+    logging.info("\n=== 결측치 처리 전 현황 ===")
+    logging.info(f"\n{missing_stats[missing_stats > 0]}")
+    
+    # 결측치가 있는 행 분석
+    missing_rows = processed[processed.isnull().any(axis=1)]
+    logging.info("\n=== 결측치 포함 행의 특성 ===")
+    logging.info(f"\n{missing_rows}")
+    
+    # 2. 특성 구분
+    numeric_features = ['인원당_결제금액', '피로도(하락)', '피로도(상승)']
+    style_features = [col for col in data.columns if '여행스타일' in col]
+    
+    # 3. 결측치 처리
+    for feature in numeric_features:
+        median_value = processed[feature].median()
+        n_missing = processed[feature].isnull().sum()
+        if n_missing > 0:
+            logging.info(f"{feature}: {n_missing}개 결측치를 중앙값 {median_value:.2f}로 대체")
+            processed[feature].fillna(median_value, inplace=True)
+    
+    for feature in style_features:
+        n_missing = processed[feature].isnull().sum()
+        if n_missing > 0:
+            logging.info(f"{feature}: {n_missing}개 결측치를 '{fill_value}'로 대체")
+            processed[feature].fillna(fill_value, inplace=True)
+    
+    # 4. 여행스타일 인코딩
+    encoded_data = processed.copy()
+    for col in style_features:
+        encoded_data[col] = label_encoders[col].transform(processed[col])
+    
+    # 5. 필요한 컬럼만 선택
+    final_data = encoded_data[numeric_features + style_features]
+    
+    # 6. 데이터 검증
+    try:
+        assert final_data.isnull().sum().sum() == 0, "결측치가 남아있습니다"
+        assert len(final_data.columns) == 11, "컬럼 수가 맞지 않습니다"
+        assert all(final_data[feature].dtype in ['int64', 'float64'] for feature in numeric_features), "수치형 변수 타입 오류"
+        
+        logging.info("\n=== 데이터 검증 완료 ===")
+        logging.info("- 결측치 없음")
+        logging.info(f"- 컬럼 수: {len(final_data.columns)}")
+        logging.info("- 데이터 타입 정상")
+        
+    except AssertionError as e:
+        logging.error(f"데이터 검증 실패: {str(e)}")
+        raise
+    
+    logging.info("\n=== 전처리 완료 ===")
+    logging.info(f"최종 데이터 형태: {final_data.shape}")
+    logging.info("\n=== 변수별 기술 통계 ===")
+    logging.info(f"\n{final_data[numeric_features].describe()}")
+    
+    return final_data, numeric_features, style_features
+
+def find_optimal_clusters(data: pd.DataFrame, max_clusters: int = 10) -> Dict:
+    """
+    최적의 군집 수를 찾는 함수
+    - 실루엣 점수, Calinski-Harabasz 점수, Davies-Bouldin 점수를 모두 고려
+    - 각 지표별 점수를 표로 출력
+    """
+    scores = {
+        'n_clusters': [],
+        'silhouette': [],
+        'calinski_harabasz': [],
+        'davies_bouldin': []
+    }
+    
+    # 각 군집 수별 점수 계산
+    for n_clusters in range(2, max_clusters + 1):
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+        labels = kmeans.fit_predict(data)
+        
+        scores['n_clusters'].append(n_clusters)
+        scores['silhouette'].append(silhouette_score(data, labels))
+        scores['calinski_harabasz'].append(calinski_harabasz_score(data, labels))
+        scores['davies_bouldin'].append(davies_bouldin_score(data, labels))
+    
+    # 결과를 DataFrame으로 변환
+    scores_df = pd.DataFrame(scores)
+    scores_df = scores_df.set_index('n_clusters')
+    
+    # 점수 출력
+    print("\n=== 군집 수별 평가 지표 ===")
+    print("\n[점수 테이블]")
+    print(scores_df.round(3))
+    
+    # 최적 군집 수 추천
+    best_silhouette = scores_df['silhouette'].idxmax()
+    best_calinski = scores_df['calinski_harabasz'].idxmax()
+    best_davies = scores_df['davies_bouldin'].idxmin()
+    
+    print("\n[최적 군집 수 추천]")
+    print(f"- 실루엣 점수 기준: {best_silhouette} 군집")
+    print(f"- Calinski-Harabasz 점수 기준: {best_calinski} 군집")
+    print(f"- Davies-Bouldin 점수 기준: {best_davies} 군집")
+    
+    # 시각화
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.plot(scores_df.index, scores_df['silhouette'], marker='o')
+    plt.title('실루엣 점수\n(높을수록 좋음)')
+    plt.xlabel('군집 수')
+    plt.axvline(x=best_silhouette, color='r', linestyle='--', alpha=0.5)
+    
+    plt.subplot(1, 3, 2)
+    plt.plot(scores_df.index, scores_df['calinski_harabasz'], marker='o')
+    plt.title('Calinski-Harabasz 점수\n(높을수록 좋음)')
+    plt.xlabel('군집 수')
+    plt.axvline(x=best_calinski, color='r', linestyle='--', alpha=0.5)
+    
+    plt.subplot(1, 3, 3)
+    plt.plot(scores_df.index, scores_df['davies_bouldin'], marker='o')
+    plt.title('Davies-Bouldin 점수\n(낮을수록 좋음)')
+    plt.xlabel('군집 수')
+    plt.axvline(x=best_davies, color='r', linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 실루엣 점수 기준으로 최적 군집 수 반환
+    return {
+        'scores': scores_df,
+        'optimal_n': best_silhouette,
+        'all_best': {
+            'silhouette': best_silhouette,
+            'calinski': best_calinski,
+            'davies': best_davies
+        }
+    }
+
+def visualize_cluster_analysis(data: pd.DataFrame, numeric_features: List[str], 
+                             clusters: np.ndarray, title_prefix: str = ""):
+    """
+    클러스터 분석 결과를 시각화하는 함수 (경고 메시지 해결 버전)
+    """
+    set_korean_font()
+    data_with_clusters = data.copy()
+    data_with_clusters['Cluster'] = clusters.astype(str)  # 클러스터를 문자열로 변환
+    
+    # 1. 피로도와 결제금액 관계
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 2, 1)
+    sns.scatterplot(
+        data=data_with_clusters,
+        x='피로도(하락)',
+        y='인원당_결제금액',
+        hue='Cluster',
+        legend=True,
+        alpha=0.6
+    )
+    plt.yscale('log')
+    plt.title(f'{title_prefix}피로도(하락)와 결제금액 관계')
+    
+    plt.subplot(1, 2, 2)
+    sns.scatterplot(
+        data=data_with_clusters,
+        x='피로도(상승)',
+        y='인원당_결제금액',
+        hue='Cluster',
+        legend=True,
+        alpha=0.6
+    )
+    plt.yscale('log')
+    plt.title(f'{title_prefix}피로도(상승)과 결제금액 관계')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 2. 클러스터별 특성 분포
+    plt.figure(figsize=(15, 6))
+    feature_labels = {
+        '인원당_결제금액': '인원당 결제금액',
+        '피로도(하락)': '피로도 (하락)',
+        '피로도(상승)': '피로도 (상승)'
+    }
+    
+    for i, feature in enumerate(numeric_features, 1):
+        plt.subplot(1, len(numeric_features), i)
+        sns.boxplot(
+            data=data_with_clusters,
+            x='Cluster',
+            y=feature,
+            hue='Cluster',
+            legend=False
+        )
+        plt.title(feature_labels.get(feature, feature))
+        if feature == '인원당_결제금액':
+            plt.yscale('log')
+    plt.tight_layout()
+    plt.show()
+    
+    # 3. 클러스터별 평균 특성
+    plt.figure(figsize=(12, 6))
+    cluster_means = data_with_clusters.groupby('Cluster')[numeric_features].mean()
+    cluster_means.columns = [feature_labels.get(col, col) for col in cluster_means.columns]
+    
+    # 데이터 정규화를 위한 중심값 계산
+    center = cluster_means.mean().mean()
+    
+    # heatmap with improved annotations
+    sns.heatmap(
+        cluster_means,
+        annot=True,
+        fmt='.0f',
+        cmap='coolwarm',
+        center=center,
+        cbar_kws={'label': '평균값'}
+    )
+    plt.title(f'{title_prefix}클러스터별 특성 평균')
+    plt.show()
+    
+    # 4. 추가: 클러스터별 분포 요약
+    summary_stats = data_with_clusters.groupby('Cluster').agg({
+        '인원당_결제금액': ['mean', 'median', 'std', 'count'],
+        '피로도(하락)': ['mean', 'median', 'std'],
+        '피로도(상승)': ['mean', 'median', 'std']
+    }).round(2)
+    
+    print("\n=== 클러스터별 통계 요약 ===")
+    print(summary_stats)
+
+def comprehensive_travel_analysis(data: pd.DataFrame, clusters: np.ndarray):
+    """
+    여행 패턴 종합 분석 시스템 (시각화 경고 해결 버전)
+    """
+    data_with_clusters = data.copy()
+    data_with_clusters['cluster'] = clusters.astype(str)
+    
+    def analyze_people_patterns():
+        # 인원 규모 구분
+        data_with_clusters['인원구분'] = pd.cut(
+            data_with_clusters['여행인원'],
+            bins=[0, 1, 2, 4, float('inf')],
+            labels=['1인', '2인', '소그룹(3-4인)', '단체(5인이상)']
+        )
+        
+        # 시각화 개선
+        plt.figure(figsize=(15, 5))
+        
+        plt.subplot(131)
+        sns.boxplot(
+            data=data_with_clusters,
+            x='인원구분',
+            y='인원당_결제금액',
+            hue='cluster',
+            legend=True,
+            showfliers=False
+        )
+        plt.title('인원 규모별 1인당 비용 분포')
+        plt.xticks(rotation=45)
+        
+        plt.subplot(132)
+        sns.boxplot(
+            data=data_with_clusters,
+            x='인원구분',
+            y='체류시간_분',
+            hue='cluster',
+            legend=False,
+            showfliers=False
+        )
+        plt.title('인원 규모별 체류시간 분포')
+        plt.xticks(rotation=45)
+        
+        plt.subplot(133)
+        sns.boxplot(
+            data=data_with_clusters,
+            x='인원구분',
+            y='방문횟수',
+            hue='cluster',
+            legend=False,
+            showfliers=False
+        )
+        plt.title('인원 규모별 방문횟수 분포')
+        plt.xticks(rotation=45)
+        
+        plt.tight_layout()
+        plt.show()
+        
+def analyze_cluster_characteristics(data: pd.DataFrame, clusters: np.ndarray,
+                                 numeric_features: List[str], style_features: List[str],
+                                 label_encoders: Dict[str, LabelEncoder]) -> pd.DataFrame:
+    """
+    각 클러스터의 특성을 상세히 분석하는 함수
+    """
+    data_with_clusters = data.copy()
+    data_with_clusters['Cluster'] = clusters
+    
+    stats_dict = {}  # 딕셔너리로 변경
+    
+    for cluster in range(clusters.max() + 1):
+        cluster_data = data_with_clusters[data_with_clusters['Cluster'] == cluster]
+        
+        # 기본 통계
+        cluster_stats = {
+            '클러스터_크기': len(cluster_data),
+            '클러스터_비율': len(cluster_data) / len(data) * 100,
+        }
+        
+        # 수치형 특성 통계
+        for feature in numeric_features:
+            cluster_stats.update({
+                f'{feature}_평균': cluster_data[feature].mean(),
+                f'{feature}_중앙값': cluster_data[feature].median(),
+                f'{feature}_표준편차': cluster_data[feature].std()
+            })
+        
+        # 여행 스타일 특성
+        for col in style_features:
+            value_counts = cluster_data[col].value_counts()
+            most_common = value_counts.index[0]
+            
+            if isinstance(most_common, (int, np.integer)):
+                style_value = label_encoders[col].inverse_transform([most_common])[0]
+            else:
+                style_value = most_common
+                
+            cluster_stats[f'{col}_주요특성'] = style_value
+            cluster_stats[f'{col}_비율'] = (value_counts.iloc[0] / len(cluster_data)) * 100
+        
+        stats_dict[f'클러스터_{cluster}'] = cluster_stats
+    
+    # DataFrame 생성 시 전치하여 생성
+    result_df = pd.DataFrame(stats_dict)
+    
+    return result_df
+
+def interpret_clusters(profiles: pd.DataFrame, original_data: pd.DataFrame) -> Dict[str, str]:
+    """
+    클러스터 분석 결과를 해석하는 함수
+    """
+    logging.info(f"프로필 데이터 크기: {profiles.shape}")
+    logging.info(f"프로필 컬럼: {profiles.columns.tolist()}")
+    
+    interpretations = {}
+    total_mean = original_data['인원당_결제금액'].mean()
+    
+    for col in profiles.columns:  # 클러스터 컬럼 순회
+        cluster_data = profiles[col]  # 각 클러스터 컬럼의 데이터
+        cluster_num = int(col.split('_')[1])  # '클러스터_0' -> 0
+        
+        # 소비 수준 판단
+        spending_level = "높음" if cluster_data['인원당_결제금액_평균'] > total_mean else "낮음"
+        
+        # 피로도 영향 판단
+        fatigue_change = cluster_data['피로도(상승)_평균'] - cluster_data['피로도(하락)_평균']
+        if fatigue_change > 0.5:
+            fatigue_pattern = "크게 증가"
+        elif fatigue_change > 0:
+            fatigue_pattern = "약간 증가"
+        else:
+            fatigue_pattern = "안정적"
+        
+        interpretation = f"""
+        [클러스터 {cluster_num} 특성]
+        1. 규모와 비중
+           - 여행 건수: {int(cluster_data['클러스터_크기']):,}건
+           - 전체 대비 비율: {float(cluster_data['클러스터_비율']):.1f}%
+        
+        2. 소비 패턴
+           - 수준: {spending_level}
+           - 평균 결제금액: {float(cluster_data['인원당_결제금액_평균']):,.0f}원
+           - 중앙값: {float(cluster_data['인원당_결제금액_중앙값']):,.0f}원
+        
+        3. 피로도 패턴
+           - 변화 양상: {fatigue_pattern}
+           - 하락 평균: {float(cluster_data['피로도(하락)_평균']):.2f}
+           - 상승 평균: {float(cluster_data['피로도(상승)_평균']):.2f}
+        
+        4. 주요 여행 스타일
+           - 지역 선호: {cluster_data['여행스타일_1_주요특성']}
+           - 체류 형태: {cluster_data['여행스타일_2_주요특성']}
+           - 지역 친숙도: {cluster_data['여행스타일_3_주요특성']}
+           - 숙소 선호: {cluster_data['여행스타일_4_주요특성']}
+           - 활동 유형: {cluster_data['여행스타일_5_주요특성']}
+           - 관광지 선호: {cluster_data['여행스타일_6_주요특성']}
+           - 여행 계획성: {cluster_data['여행스타일_7_주요특성']}
+           - 사진 중요도: {cluster_data['여행스타일_8_주요특성']}
+        """
+        
+        interpretations[col] = interpretation.strip()
+        logging.info(f"{col} 해석 완료")
+    
+    return interpretations
+
+def analyze_travel_patterns(data: pd.DataFrame) -> Dict:
+    try:
+        logging.info("여행 패턴 분석 시작")
+        
+        # 1. 라벨 인코더 생성
+        label_encoders = create_label_encoders()
+        
+        # 2. 데이터 전처리
+        processed_data, numeric_features, style_features = preprocess_data(data, label_encoders)
+        
+        # 3. 데이터 스케일링
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(processed_data)
+        
+        # 4. 군집 수 고정
+        n_clusters = 7  # 7개 군집으로 고정
+        logging.info(f"{n_clusters}개 군집으로 분석을 수행합니다.")
+        
+        # 5. K-means 클러스터링
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+        kmeans_clusters = kmeans.fit_predict(scaled_data)
+        
+        # 6. 클러스터 분석 시각화
+        raw_numeric_data = data[numeric_features].copy()
+        visualize_cluster_analysis(
+            raw_numeric_data, 
+            numeric_features,
+            kmeans_clusters,
+            "K-means: "
+        )
+        
+        # 7. 클러스터 특성 분석
+        cluster_profiles = analyze_cluster_characteristics(
+            data,
+            kmeans_clusters,
+            numeric_features,
+            style_features,
+            label_encoders
+        )
+        
+        # 8. 세부 특성 분석
+        detailed_analysis = analyze_cluster_details(
+            data,
+            kmeans_clusters,
+            numeric_features,
+            style_features
+        )
+        
+        # 9. 결과 해석
+        interpretations = interpret_clusters(cluster_profiles, data)
+        
+        return {
+            'clusters': kmeans_clusters,
+            'profiles': cluster_profiles,
+            'interpretations': interpretations,
+            'detailed_analysis': detailed_analysis,
+            'numeric_features': numeric_features,
+            'style_features': style_features,
+            'original_data': data  # 원본 데이터 추가
+        }
+        
+    except Exception as e:
+        logging.error(f"분석 중 오류 발생: {str(e)}")
+        logging.error(traceback.format_exc())
+        raise
+
+def export_cluster_results(data: pd.DataFrame, clusters: np.ndarray, 
+                         output_path: str = None,
+                         include_details: bool = True) -> None:
+    """
+    군집 분석 결과를 로우데이터 형태로 내보내는 함수
+    
+    Parameters:
+    -----------
+    data : pd.DataFrame
+        원본 데이터프레임
+    clusters : np.ndarray
+        군집 분석 결과 레이블
+    output_path : str
+        결과 파일 저장 경로 (기본값: 현재 작업 디렉토리)
+    include_details : bool
+        세부 통계 포함 여부
+    """
+    try:
+        # 기본 저장 경로 설정
+        if output_path is None:
+            output_path = os.path.join(os.getcwd(), "cluster_results")
+        
+        # 저장할 디렉토리 생성
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # 1. 기본 결과 데이터 생성
+        result_df = data.copy()
+        result_df['cluster_label'] = clusters
+        
+        # 2. 클러스터별 통계 계산
+        cluster_stats = result_df.groupby('cluster_label').agg({
+            '인원당_결제금액': ['mean', 'median', 'std'],
+            '피로도(하락)': ['mean', 'median', 'std'],
+            '피로도(상승)': ['mean', 'median', 'std']
+        }).round(2)
+        
+        # 다중 인덱스 컬럼을 단일 인덱스로 변환
+        cluster_stats.columns = [f'{col[0]}_{col[1]}' for col in cluster_stats.columns]
+        
+        # 3. 클러스터 크기 및 비율 계산
+        cluster_size = result_df['cluster_label'].value_counts().sort_index()
+        cluster_ratio = (cluster_size / len(result_df) * 100).round(2)
+        
+        # 통계 정보를 각 행에 추가
+        for stat_col in cluster_stats.columns:
+            result_df[f'cluster_{stat_col}'] = result_df['cluster_label'].map(cluster_stats[stat_col])
+        
+        result_df['cluster_size'] = result_df['cluster_label'].map(cluster_size)
+        result_df['cluster_ratio'] = result_df['cluster_label'].map(cluster_ratio)
+        
+        # 4. 클러스터별 여행 스타일 모드값 추가
+        style_cols = [col for col in data.columns if '여행스타일' in col]
+        for col in style_cols:
+            mode_values = result_df.groupby('cluster_label')[col].agg(lambda x: x.mode().iloc[0])
+            result_df[f'cluster_{col}_mode'] = result_df['cluster_label'].map(mode_values)
+        
+        # 5. 시간 관련 변수 추가 (시계열 분석용)
+        if '여행일자' in result_df.columns:
+            result_df['여행일자'] = pd.to_datetime(result_df['여행일자'])
+            result_df['year'] = result_df['여행일자'].dt.year
+            result_df['month'] = result_df['여행일자'].dt.month
+            result_df['weekday'] = result_df['여행일자'].dt.dayofweek
+            result_df['quarter'] = result_df['여행일자'].dt.quarter
+        
+        # 6. 코호트 분석용 변수 추가
+        if '최초여행일자' in result_df.columns:
+            result_df['최초여행일자'] = pd.to_datetime(result_df['최초여행일자'])
+            result_df['cohort_year'] = result_df['최초여행일자'].dt.year
+            result_df['cohort_month'] = result_df['최초여행일자'].dt.month
+            result_df['cohort_quarter'] = result_df['최초여행일자'].dt.quarter
+        
+        # 7. 결과 저장
+        try:
+            # CSV 형식으로 저장
+            csv_path = f"{output_path}.csv"
+            result_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+            logging.info(f"CSV 파일이 저장되었습니다: {csv_path}")
+        except Exception as e:
+            logging.error(f"CSV 파일 저장 실패: {str(e)}")
+            # 대체 경로에 저장 시도
+            alt_csv_path = os.path.join(os.path.expanduser('~'), 'Desktop', 'cluster_results.csv')
+            result_df.to_csv(alt_csv_path, index=False, encoding='utf-8-sig')
+            logging.info(f"CSV 파일이 데스크톱에 저장되었습니다: {alt_csv_path}")
+        
+        try:
+            # Excel 형식으로 저장
+            excel_path = f"{output_path}.xlsx"
+            with pd.ExcelWriter(excel_path) as writer:
+                # 메인 데이터
+                result_df.to_excel(writer, sheet_name='raw_data', index=False)
+                
+                # 클러스터별 요약 통계
+                summary_stats = pd.concat([
+                    cluster_stats,
+                    pd.DataFrame({
+                        'cluster_size': cluster_size,
+                        'cluster_ratio': cluster_ratio
+                    })
+                ], axis=1)
+                summary_stats.to_excel(writer, sheet_name='cluster_summary')
+                
+                # 시계열 요약 (있는 경우)
+                if '여행일자' in result_df.columns:
+                    time_series = result_df.groupby(['year', 'month', 'cluster_label']).agg({
+                        '인원당_결제금액': ['mean', 'count'],
+                        'cluster_ratio': 'first'
+                    }).round(2)
+                    time_series.to_excel(writer, sheet_name='time_series_summary')
+                
+                # 코호트 요약 (있는 경우)
+                if '최초여행일자' in result_df.columns:
+                    cohort_summary = result_df.groupby(['cohort_year', 'cohort_month', 'cluster_label']).agg({
+                        '인원당_결제금액': ['mean', 'count'],
+                        'cluster_ratio': 'first'
+                    }).round(2)
+                    cohort_summary.to_excel(writer, sheet_name='cohort_summary')
+            logging.info(f"Excel 파일이 저장되었습니다: {excel_path}")
+        except Exception as e:
+            logging.error(f"Excel 파일 저장 실패: {str(e)}")
+            # 대체 경로에 저장 시도
+            alt_excel_path = os.path.join(os.path.expanduser('~'), 'Desktop', 'cluster_results.xlsx')
+            with pd.ExcelWriter(alt_excel_path) as writer:
+                result_df.to_excel(writer, sheet_name='raw_data', index=False)
+            logging.info(f"Excel 파일이 데스크톱에 저장되었습니다: {alt_excel_path}")
+        
+        return result_df
+        
+    except Exception as e:
+        logging.error(f"결과 내보내기 중 오류 발생: {str(e)}")
+        logging.error(traceback.format_exc())
+        raise
+
+def analyze_cluster_details(data: pd.DataFrame, clusters: np.ndarray,
+                          numeric_features: List[str], style_features: List[str]) -> Dict:
+    """
+    클러스터별 세부 특성을 분석하는 함수
+    """
+    detailed_stats = {}
+    data_with_clusters = data.copy()
+    data_with_clusters['Cluster'] = clusters
+    
+    for cluster in range(clusters.max() + 1):
+        cluster_data = data_with_clusters[data_with_clusters['Cluster'] == cluster]
+        
+        # 1. 소비 패턴 세부 분석
+        spending_analysis = {
+            '최소_결제금액': cluster_data['인원당_결제금액'].min(),
+            '최대_결제금액': cluster_data['인원당_결제금액'].max(),
+            '결제금액_25%': cluster_data['인원당_결제금액'].quantile(0.25),
+            '결제금액_75%': cluster_data['인원당_결제금액'].quantile(0.75),
+            '결제금액_IQR': cluster_data['인원당_결제금액'].quantile(0.75) - 
+                          cluster_data['인원당_결제금액'].quantile(0.25)
+        }
+        
+        # 2. 피로도 패턴 세부 분석
+        fatigue_analysis = {
+            '피로도_변화_분산': (cluster_data['피로도(상승)'] - cluster_data['피로도(하락)']).var(),
+            '피로도_상승_최대': cluster_data['피로도(상승)'].max(),
+            '피로도_하락_최대': cluster_data['피로도(하락)'].max(),
+            '높은_피로도_비율': len(cluster_data[cluster_data['피로도(상승)'] > 
+                                              cluster_data['피로도(상승)'].mean()]) / len(cluster_data) * 100
+        }
+        
+        # 3. 체류시간과 방문횟수 분석
+        temporal_analysis = {
+            '평균_체류시간': cluster_data['체류시간_분'].mean(),
+            '체류시간_중앙값': cluster_data['체류시간_분'].median(),
+            '평균_방문횟수': cluster_data['방문횟수'].mean(),
+            '최대_방문횟수': cluster_data['방문횟수'].max()
+        }
+        
+        # 4. 여행 스타일 조합 분석
+        style_counts = {}
+        for style in style_features:
+            value_counts = cluster_data[style].value_counts()
+            style_counts[style] = {
+                '주요_스타일': value_counts.index[0],
+                '비율': (value_counts.iloc[0] / len(cluster_data)) * 100
+            }
+        
+        detailed_stats[f'클러스터_{cluster}'] = {
+            'size': len(cluster_data),
+            'proportion': len(cluster_data) / len(data) * 100,
+            'spending_patterns': spending_analysis,
+            'fatigue_patterns': fatigue_analysis,
+            'temporal_patterns': temporal_analysis,
+            'style_patterns': style_counts
+        }
+    
+    return detailed_stats
+
+def interpret_clusters(profiles: pd.DataFrame, original_data: pd.DataFrame) -> Dict[str, str]:
+    """
+    클러스터 분석 결과를 해석하는 함수
+    """
+    interpretations = {}
+    total_mean = original_data['인원당_결제금액'].mean()
+    
+    for cluster in range(len(profiles.columns)):
+        col_name = f'클러스터_{cluster}'  # 컬럼명 수정
+        cluster_data = profiles[col_name]
+        
+        # 소비 수준 판단
+        spending_level = "높음" if float(cluster_data['인원당_결제금액_평균']) > total_mean else "낮음"
+        
+        # 피로도 영향 판단
+        fatigue_change = float(cluster_data['피로도(상승)_평균']) - float(cluster_data['피로도(하락)_평균'])
+        if fatigue_change > 0.5:
+            fatigue_pattern = "크게 증가"
+        elif fatigue_change > 0:
+            fatigue_pattern = "약간 증가"
+        else:
+            fatigue_pattern = "안정적"
+        
+        interpretation = f"""
+        [클러스터 {cluster} 특성]
+        1. 규모와 비중
+           - 여행 건수: {int(cluster_data['클러스터_크기']):,}건
+           - 전체 대비 비율: {float(cluster_data['클러스터_비율']):.1f}%
+        
+        2. 소비 패턴
+           - 수준: {spending_level}
+           - 평균 결제금액: {float(cluster_data['인원당_결제금액_평균']):,.0f}원
+           - 중앙값: {float(cluster_data['인원당_결제금액_중앙값']):,.0f}원
+        
+        3. 피로도 패턴
+           - 변화 양상: {fatigue_pattern}
+           - 하락 평균: {float(cluster_data['피로도(하락)_평균']):.2f}
+           - 상승 평균: {float(cluster_data['피로도(상승)_평균']):.2f}
+        
+        4. 주요 여행 스타일
+           - 지역 선호: {cluster_data['여행스타일_1_주요특성']}
+           - 체류 형태: {cluster_data['여행스타일_2_주요특성']}
+           - 지역 친숙도: {cluster_data['여행스타일_3_주요특성']}
+           - 숙소 선호: {cluster_data['여행스타일_4_주요특성']}
+           - 활동 유형: {cluster_data['여행스타일_5_주요특성']}
+           - 관광지 선호: {cluster_data['여행스타일_6_주요특성']}
+           - 여행 계획성: {cluster_data['여행스타일_7_주요특성']}
+           - 사진 중요도: {cluster_data['여행스타일_8_주요특성']}
+        """
+        
+        interpretations[col_name] = interpretation.strip()
+    
+    return interpretations
+
+def comprehensive_travel_analysis(data: pd.DataFrame, clusters: np.ndarray):
+    """
+    여행 패턴 종합 분석 시스템
+    """
+    data_with_clusters = data.copy()
+    data_with_clusters['cluster'] = clusters.astype(str)
+    
+    # 1. 인원 중심 분석 (People-Centric)
+    def analyze_people_patterns():
+        # 인원 규모 구분
+        data_with_clusters['인원구분'] = pd.cut(
+            data_with_clusters['여행인원'],
+            bins=[0, 1, 2, 4, float('inf')],
+            labels=['1인', '2인', '소그룹(3-4인)', '단체(5인이상)']
+        )
+        
+        # 1-1. 인원 규모별 기본 통계
+        size_stats = data_with_clusters.groupby(['cluster', '인원구분']).agg({
+            '인원당_결제금액': ['mean', 'median', 'count'],
+            '체류시간_분': ['mean', 'median'],
+            '방문횟수': 'mean',
+            '여행스타일_1': lambda x: x.mode().iloc[0],
+            '여행스타일_5': lambda x: x.mode().iloc[0]
+        }).round(2)
+        
+        # 1-2. 인원별 선호 패턴
+        preference_stats = data_with_clusters.groupby('인원구분').agg({
+            '여행스타일_1': lambda x: x.mode().iloc[0],
+            '여행스타일_2': lambda x: x.mode().iloc[0],
+            '여행스타일_5': lambda x: x.mode().iloc[0],
+            '인원당_결제금액': 'mean',
+            '체류시간_분': 'mean'
+        }).round(2)
+        
+        # 1-3. 인원 규모별 시각화
+        plt.figure(figsize=(15, 5))
+        
+        # 비용 분포
+        plt.subplot(131)
+        sns.boxplot(data=data_with_clusters,
+                   x='인원구분',
+                   y='인원당_결제금액',
+                   hue='cluster',
+                   showfliers=False)
+        plt.title('인원 규모별 1인당 비용 분포')
+        plt.xticks(rotation=45)
+        
+        # 체류시간 분포
+        plt.subplot(132)
+        sns.boxplot(data=data_with_clusters,
+                   x='인원구분',
+                   y='체류시간_분',
+                   hue='cluster',
+                   showfliers=False)
+        plt.title('인원 규모별 체류시간 분포')
+        plt.xticks(rotation=45)
+        
+        # 방문횟수 분포
+        plt.subplot(133)
+        sns.boxplot(data=data_with_clusters,
+                   x='인원구분',
+                   y='방문횟수',
+                   hue='cluster',
+                   showfliers=False)
+        plt.title('인원 규모별 방문횟수 분포')
+        plt.xticks(rotation=45)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return size_stats, preference_stats
+    
+    # 2. 효율성 중심 분석 (Efficiency-Centric)
+    def analyze_efficiency_patterns():
+        # 2-1. 효율성 지표 계산
+        data_with_clusters['시간당_비용'] = (data_with_clusters['인원당_결제금액'] / 
+                                        data_with_clusters['체류시간_분']) * 60
+        data_with_clusters['방문당_비용'] = data_with_clusters['인원당_결제금액'] / data_with_clusters['방문횟수']
+        data_with_clusters['시간당_방문'] = data_with_clusters['방문횟수'] / (data_with_clusters['체류시간_분']/60)
+        
+        # 2-2. 효율성 통계
+        efficiency_stats = data_with_clusters.groupby('cluster').agg({
+            '시간당_비용': ['mean', 'median', 'std'],
+            '방문당_비용': ['mean', 'median', 'std'],
+            '시간당_방문': ['mean', 'median', 'std']
+        }).round(2)
+        
+        # 2-3. 효율성 시각화
+        plt.figure(figsize=(15, 5))
+        
+        # 시간당 비용
+        plt.subplot(131)
+        sns.boxplot(data=data_with_clusters,
+                   x='cluster',
+                   y='시간당_비용',
+                   showfliers=False)
+        plt.title('클러스터별 시간당 비용')
+        
+        # 방문당 비용
+        plt.subplot(132)
+        sns.boxplot(data=data_with_clusters,
+                   x='cluster',
+                   y='방문당_비용',
+                   showfliers=False)
+        plt.title('클러스터별 방문당 비용')
+        
+        # 시간당 방문횟수
+        plt.subplot(133)
+        sns.boxplot(data=data_with_clusters,
+                   x='cluster',
+                   y='시간당_방문',
+                   showfliers=False)
+        plt.title('클러스터별 시간당 방문횟수')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return efficiency_stats
+    
+    # 3. 스타일 중심 분석 (Style-Centric)
+    def analyze_style_patterns():
+        style_cols = [col for col in data.columns if '여행스타일' in col]
+        
+        # 3-1. 스타일 분포
+        style_dist = pd.DataFrame()
+        for col in style_cols:
+            style_dist[col] = data_with_clusters.groupby('cluster')[col].agg(
+                lambda x: x.mode().iloc[0]
+            )
+        
+        # 3-2. 스타일별 세부 통계
+        style_details = {}
+        for style in style_cols:
+            style_details[style] = data_with_clusters.groupby(['cluster', style]).agg({
+                '인원당_결제금액': ['mean', 'count'],
+                '체류시간_분': 'mean',
+                '방문횟수': 'mean'
+            }).round(2)
+        
+        # 3-3. 스타일 조합 패턴
+        style_combinations = data_with_clusters.groupby('cluster').apply(
+            lambda x: pd.Series({
+                '대표스타일': '_'.join([x[style].mode().iloc[0] for style in style_cols[:3]]),
+                '선호활동': x['여행스타일_5'].mode().iloc[0],
+                '계획성': x['여행스타일_7'].mode().iloc[0]
+            })
+        )
+        
+        # 3-4. 스타일 시각화
+        plt.figure(figsize=(15, 10))
+        
+        # 주요 스타일별 비용
+        for i, style in enumerate(style_cols[:6]):
+            plt.subplot(2, 3, i+1)
+            sns.boxplot(data=data_with_clusters,
+                       x=style,
+                       y='인원당_결제금액',
+                       hue='cluster',
+                       showfliers=False)
+            plt.title(f'{style} 별 비용 분포')
+            plt.xticks(rotation=45)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return style_dist, style_details, style_combinations
+    
+    # 분석 실행 및 결과 출력
+    print("\n=== 1. 인원 중심 분석 ===")
+    size_stats, preference_stats = analyze_people_patterns()
+    print("\n[인원 규모별 통계]")
+    print(size_stats)
+    print("\n[인원별 선호 패턴]")
+    print(preference_stats)
+    
+    print("\n=== 2. 효율성 분석 ===")
+    efficiency_stats = analyze_efficiency_patterns()
+    print("\n[효율성 지표]")
+    print(efficiency_stats)
+    
+    print("\n=== 3. 여행 스타일 분석 ===")
+    style_dist, style_details, style_combinations = analyze_style_patterns()
+    print("\n[클러스터별 대표 스타일]")
+    print(style_dist)
+    print("\n[스타일 조합 패턴]")
+    print(style_combinations)
+    
+    return {
+        'people_analysis': {'size_stats': size_stats, 'preference_stats': preference_stats},
+        'efficiency_analysis': efficiency_stats,
+        'style_analysis': {'style_dist': style_dist, 
+                          'style_details': style_details, 
+                          'style_combinations': style_combinations}
+    }
+
+# comprehensive_travel_analysis 함수 정의 후...
+
+def analyze_temporal_patterns(data: pd.DataFrame, clusters: np.ndarray) -> Dict:
+    """
+    시계열 패턴 분석 함수 (시각화 개선)
+    """
+    df = data.copy()
+    df['cluster'] = clusters.astype(str)
+    
+    try:
+        # 날짜 처리
+        df['방문시작일자'] = pd.to_datetime(df['방문시작일자'])
+        df['월'] = df['방문시작일자'].dt.month
+        
+        # 시각화
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # 1. 월별 평균 결제금액 트렌드
+        monthly_spending = df.groupby(['월', 'cluster'])['인원당_결제금액'].mean().unstack()
+        monthly_spending.plot(marker='o', ax=ax1)
+        ax1.set_title('월별 평균 결제금액')
+        ax1.set_xlabel('월')
+        ax1.set_ylabel('평균 결제금액')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(title='클러스터', bbox_to_anchor=(1.02, 1))
+        
+        # 2. 월별 평균 체류시간 트렌드
+        monthly_duration = df.groupby(['월', 'cluster'])['체류시간_분'].mean().unstack()
+        monthly_duration.plot(marker='o', ax=ax2)
+        ax2.set_title('월별 평균 체류시간')
+        ax2.set_xlabel('월')
+        ax2.set_ylabel('평균 체류시간 (분)')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(title='클러스터', bbox_to_anchor=(1.02, 1))
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # 분석 결과 저장
+        results = {
+            'monthly_spending': monthly_spending,
+            'monthly_duration': monthly_duration,
+            'summary': {
+                'spending_trend': monthly_spending.mean(),
+                'duration_trend': monthly_duration.mean()
+            }
+        }
+        
+        return results
+        
+    except Exception as e:
+        logging.error(f"시계열 분석 중 오류 발생: {str(e)}")
+        logging.error(traceback.format_exc())
+        return None
+
+def analyze_cohort_patterns(data: pd.DataFrame, clusters: np.ndarray) -> Dict:
+    """
+    연령대 정보를 포함한 코호트 분석 함수 (결제금액 시각화 개선)
+    """
+    df = data.copy()
+    df['cluster'] = clusters.astype(str)
+    
+    try:
+        # 연령대 전처리
+        age_order = ['20대', '30대', '40대', '50대', '60대']
+        df['연령대_표시'] = df['연령대'].astype(str) + '대'
+        
+        # 시각화
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # 1. 연령대별 평균 결제금액 (개선된 버전)
+        age_spending = df.pivot_table(
+            values='인원당_결제금액',
+            index='연령대_표시',
+            columns='cluster',
+            aggfunc='mean'
+        ).reindex(age_order)
+        
+        # 바 그래프 생성
+        age_spending.plot(kind='bar', ax=ax1, width=0.8)
+        
+        # 그래프 스타일링
+        ax1.set_title('연령대별 평균 결제금액', pad=20)
+        ax1.set_xlabel('연령대')
+        ax1.set_ylabel('평균 결제금액 (만원)')
+        
+        # x축 설정
+        ax1.set_xticks(range(len(age_order)))
+        ax1.set_xticklabels(age_order, rotation=0)
+        
+        # y축 설정 (만원 단위로 변경)
+        ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format(int(x/10000), ',')))
+        
+        # 그리드 설정
+        ax1.grid(axis='y', linestyle='--', alpha=0.3)
+        
+        # 범례 위치 및 스타일 조정
+        ax1.legend(title='클러스터', bbox_to_anchor=(1.02, 1), loc='upper left')
+        
+        # 값 레이블 제거 (너무 복잡해 보이는 것을 방지)
+        
+        # 2. 연령대별 여행 스타일 (이전과 동일)
+        style_dist = pd.crosstab(
+            df['연령대_표시'], 
+            df['여행스타일_1'],
+            normalize='index'
+        ).reindex(age_order) * 100
+        
+        style_dist.plot(kind='bar', stacked=True, ax=ax2, width=0.8)
+        ax2.set_title('연령대별 선호 여행스타일')
+        ax2.set_xlabel('연령대')
+        ax2.set_ylabel('비율 (%)')
+        ax2.set_xticks(range(len(age_order)))
+        ax2.set_xticklabels(age_order, rotation=0)
+        ax2.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        
+        # 3. 연령대별 여행 인원 구성 (이전과 동일)
+        df['인원구분'] = pd.cut(
+            df['여행인원'],
+            bins=[0, 1, 2, 4, float('inf')],
+            labels=['개인여행', '커플여행', '소그룹', '단체여행']
+        )
+        
+        size_dist = pd.crosstab(
+            df['연령대_표시'], 
+            df['인원구분'],
+            normalize='index'
+        ).reindex(age_order) * 100
+        
+        size_dist.plot(kind='bar', stacked=True, ax=ax3, width=0.8)
+        ax3.set_title('연령대별 여행 인원 구성')
+        ax3.set_xlabel('연령대')
+        ax3.set_ylabel('비율 (%)')
+        ax3.set_xticks(range(len(age_order)))
+        ax3.set_xticklabels(age_order, rotation=0)
+        ax3.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        
+        # 전체 레이아웃 조정
+        plt.tight_layout()
+        plt.show()
+        
+        # 결과 저장
+        results = {
+            'age_spending': age_spending,
+            'style_distribution': style_dist,
+            'size_distribution': size_dist
+        }
+        
+        # 연령대별 요약 통계
+        summary_text = "\n=== 연령대별 주요 특성 ===\n"
+        for age in age_order:
+            age_data = df[df['연령대_표시'] == age]
+            summary_text += f"\n{age} 특성:\n"
+            summary_text += f"- 평균 결제금액: {age_data['인원당_결제금액'].mean():,.0f}원\n"
+            summary_text += f"- 평균 체류시간: {age_data['체류시간_분'].mean():.1f}분\n"
+            summary_text += f"- 주요 여행스타일: {age_data['여행스타일_1'].mode().iloc[0]}\n"
+            summary_text += f"- 선호 인원구분: {age_data['인원구분'].mode().iloc[0]}\n"
+            
+            # 클러스터 분포
+            cluster_dist = age_data['cluster'].value_counts(normalize=True) * 100
+            main_cluster = cluster_dist.index[0]
+            summary_text += f"- 주요 클러스터: {main_cluster}번 ({cluster_dist.iloc[0]:.1f}%)\n"
+        
+        print(summary_text)
+        results['summary_text'] = summary_text
+        
+        return results
+        
+    except Exception as e:
+        logging.error(f"코호트 분석 중 오류 발생: {str(e)}")
+        logging.error(traceback.format_exc())
+        return None
+
+def analyze_regional_patterns(data: pd.DataFrame, clusters: np.ndarray) -> Dict:
+    """
+    지역별 여행 특성을 분석하는 함수
+    """
+    df = data.copy()
+    df['cluster'] = clusters.astype(str)
+    
+    try:
+        # 지역 순서 정의
+        region_order = ['동부', '서부', '수도권', '제주']
+        
+        # 시각화
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. 지역별 평균 결제금액
+        spending_data = df.pivot_table(
+            values='인원당_결제금액',
+            index='area',
+            columns='cluster',
+            aggfunc='mean'
+        ).reindex(region_order)
+        
+        spending_data.plot(kind='bar', ax=ax1)
+        ax1.set_title('지역별 평균 결제금액')
+        ax1.set_xlabel('지역')
+        ax1.set_ylabel('평균 결제금액 (원)')
+        ax1.legend(title='클러스터', bbox_to_anchor=(1.05, 1))
+        ax1.grid(axis='y', alpha=0.3)
+        
+        # 2. 지역별 여행스타일 분포
+        style_dist = pd.crosstab(
+            df['area'],
+            df['여행스타일_1'],
+            normalize='index'
+        ).reindex(region_order) * 100
+        
+        style_dist.plot(kind='bar', stacked=True, ax=ax2)
+        ax2.set_title('지역별 여행스타일 분포')
+        ax2.set_xlabel('지역')
+        ax2.set_ylabel('비율 (%)')
+        ax2.legend(bbox_to_anchor=(1.05, 1))
+        
+        # 3. 지역별 연령대 분포
+        age_dist = pd.crosstab(
+            df['area'],
+            df['연령대'].astype(str) + '대',
+            normalize='index'
+        ).reindex(region_order) * 100
+        
+        age_dist.plot(kind='bar', stacked=True, ax=ax3)
+        ax3.set_title('지역별 연령대 분포')
+        ax3.set_xlabel('지역')
+        ax3.set_ylabel('비율 (%)')
+        ax3.legend(bbox_to_anchor=(1.05, 1))
+        
+        # 4. 지역별 평균 체류시간
+        duration_data = df.pivot_table(
+            values='체류시간_분',
+            index='area',
+            columns='cluster',
+            aggfunc='mean'
+        ).reindex(region_order)
+        
+        duration_data.plot(kind='bar', ax=ax4)
+        ax4.set_title('지역별 평균 체류시간')
+        ax4.set_xlabel('지역')
+        ax4.set_ylabel('평균 체류시간 (분)')
+        ax4.legend(title='클러스터', bbox_to_anchor=(1.05, 1))
+        ax4.grid(axis='y', alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # 결과 저장
+        results = {
+            'spending_by_region': spending_data,
+            'style_distribution': style_dist,
+            'age_distribution': age_dist,
+            'duration_by_region': duration_data
+        }
+        
+        # 지역별 요약 통계 출력
+        print("\n=== 지역별 주요 특성 ===")
+        for region in region_order:
+            region_data = df[df['area'] == region]
+            print(f"\n{region} 특성:")
+            print(f"- 평균 결제금액: {region_data['인원당_결제금액'].mean():,.0f}원")
+            print(f"- 평균 체류시간: {region_data['체류시간_분'].mean():.1f}분")
+            print(f"- 주요 여행스타일: {region_data['여행스타일_1'].mode().iloc[0]}")
+            print(f"- 주요 연령대: {region_data['연령대'].mode().iloc[0]}대")
+            
+            # 클러스터 분포
+            cluster_dist = region_data['cluster'].value_counts(normalize=True) * 100
+            main_cluster = cluster_dist.index[0]
+            print(f"- 주요 클러스터: {main_cluster}번 ({cluster_dist.iloc[0]:.1f}%)")
+        
+        return results
+        
+    except Exception as e:
+        logging.error(f"지역 분석 중 오류 발생: {str(e)}")
+        logging.error(traceback.format_exc())
+        return None
+
+def run_advanced_analysis(data: pd.DataFrame, clusters: np.ndarray) -> Dict:
+    """
+    모든 고급 분석을 실행하는 통합 함수
+    """
+    logging.info("고급 분석 시작")
+    
+    results = {}
+    
+    # 1. 시계열 분석
+    logging.info("시계열 패턴 분석 중...")
+    try:
+        results['temporal'] = analyze_temporal_patterns(data, clusters)
+        logging.info("시계열 분석 완료")
+    except Exception as e:
+        logging.error(f"시계열 분석 중 오류 발생: {str(e)}")
+    
+    # 2. 코호트 분석
+    logging.info("세대별 코호트 분석 중...")
+    try:
+        results['cohort'] = analyze_cohort_patterns(data, clusters)
+        logging.info("코호트 분석 완료")
+    except Exception as e:
+        logging.error(f"코호트 분석 중 오류 발생: {str(e)}")
+    
+    # 3. 지역 분석
+    logging.info("지역별 특성 분석 중...")
+    try:
+        results['regional'] = analyze_regional_patterns(data, clusters)
+        logging.info("지역 분석 완료")
+    except Exception as e:
+        logging.error(f"지역 분석 중 오류 발생: {str(e)}")
+    
+    # 결과 저장
+    try:
+        desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
+        output_dir = os.path.join(desktop_path, 'travel_analysis_results')
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Excel 파일로 저장
+        with pd.ExcelWriter(os.path.join(output_dir, 'advanced_analysis_results.xlsx')) as writer:
+            # 시계열 분석 결과
+            results['temporal']['monthly_trends'].to_excel(writer, sheet_name='시계열_월별추이')
+            results['temporal']['cluster_trends'].to_excel(writer, sheet_name='시계열_클러스터별')
+            results['temporal']['weekday_patterns'].to_excel(writer, sheet_name='요일별패턴')
+            
+            # 코호트 분석 결과
+            results['cohort']['generation_stats'].to_excel(writer, sheet_name='세대별통계')
+            results['cohort']['generation_styles'].to_excel(writer, sheet_name='세대별스타일')
+            results['cohort']['generation_clusters'].to_excel(writer, sheet_name='세대별클러스터')
+            
+            # 지역 분석 결과
+            results['regional']['region_stats'].to_excel(writer, sheet_name='지역별통계')
+            results['regional']['region_clusters'].to_excel(writer, sheet_name='지역별클러스터')
+            results['regional']['region_correlation'].to_excel(writer, sheet_name='지역간상관관계')
+            
+        logging.info(f"분석 결과가 저장되었습니다: {output_dir}")
+        
+    except Exception as e:
+        logging.error(f"결과 저장 중 오류 발생: {str(e)}")
+        # 대체 경로에 저장 시도
+        try:
+            alt_path = os.path.join(os.path.expanduser('~'), 'Downloads', 'advanced_analysis_results.xlsx')
+            with pd.ExcelWriter(alt_path) as writer:
+                for analysis_type, analysis_results in results.items():
+                    for key, df in analysis_results.items():
+                        if isinstance(df, pd.DataFrame):
+                            sheet_name = f"{analysis_type}_{key}"[:31]  # Excel 시트명 제한
+                            df.to_excel(writer, sheet_name=sheet_name)
+            logging.info(f"분석 결과가 대체 경로에 저장되었습니다: {alt_path}")
+        except Exception as sub_e:
+            logging.error(f"대체 경로 저장 중 오류 발생: {str(sub_e)}")
+    
+    return results
+
+def generate_insight_report(results: Dict) -> str:
+    """
+    분석 결과를 바탕으로 인사이트 리포트를 생성하는 함수
+    """
+    report = """
+    === 여행 패턴 심화 분석 리포트 ===
+    
+    1. 시간적 패턴 분석
+    -------------------
+    * 전반적 트렌드:
+    - 월별 평균 결제금액 변화 추이 분석
+    - 계절성 패턴 식별
+    - 클러스터별 시간대 선호도 차이
+    
+    2. 세대별 특성 분석
+    ------------------
+    * 세대구분별 주요 특징:
+    - 각 세대의 소비 패턴
+    - 선호하는 여행 스타일
+    - 클러스터 분포 특성
+    
+    3. 지역별 특성 분석
+    ------------------
+    * 지역별 주요 특징:
+    - 지역간 방문 패턴 상관관계
+    - 계절적 선호도 차이
+    - 클러스터별 선호 지역
+    
+    === 주요 발견점 ===
+    """
+    
+    # 시간적 패턴 인사이트
+    temporal = results['temporal']
+    peak_month = temporal['monthly_trends']['인원당_결제금액']['mean'].idxmax()
+    report += f"\n* 성수기: {peak_month[0]}년 {peak_month[1]}월이 가장 높은 평균 결제금액 기록"
+    
+    # 세대별 특성 인사이트
+    cohort = results['cohort']
+    main_gen = cohort['generation_stats']['인원당_결제금액']['mean'].idxmax()
+    report += f"\n* 최고 소비 세대: {main_gen}가 가장 높은 평균 결제금액 기록"
+    
+    # 지역별 특성 인사이트
+    regional = results['regional']
+    pop_region = regional['region_stats']['인원당_결제금액']['mean'].idxmax()
+    report += f"\n* 인기 지역: {pop_region}이 가장 높은 평균 결제금액 기록"
+    
+    return report
+
+# 메인 실행 함수
+def main():
+    """
+    메인 실행 함수
+    """
+    try:
+        # 1. 한글 폰트 설정
+        set_korean_font()
+        
+        # 2. 데이터 로드 및 확인
+        file_path = r"E:\travel_style_three_v2.csv"
+        logging.info("데이터 로드 중...")
+        data = pd.read_csv(file_path)
+        logging.info(f"데이터 로드 완료: {len(data)}행")
+        
+        print("\n=== 데이터 컬럼 목록 ===")
+        print(data.columns.tolist())
+        print("\n=== 데이터 샘플 ===")
+        print(data.head())
+        print("\n=== 결측치 현황 ===")
+        print(data.isnull().sum())
+        
+        # 3. 기본 클러스터 분석
+        logging.info("\n=== 클러스터 분석 시작 ===")
+        cluster_results = analyze_travel_patterns(data)
+        clusters = cluster_results['clusters']
+        
+        # 4. 시계열 분석
+        logging.info("\n=== 시계열 분석 시작 ===")
+        temporal_results = analyze_temporal_patterns(data, clusters)
+        
+        # 5. 코호트 분석
+        logging.info("\n=== 코호트 분석 시작 ===")
+        cohort_results = analyze_cohort_patterns(data, clusters)
+        
+        # 6. 지역 분석
+        logging.info("\n=== 지역 분석 시작 ===")
+        regional_results = analyze_regional_patterns(data, clusters)
+        
+        # 7. 결과 저장
+        desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
+        output_dir = os.path.join(desktop_path, 'travel_analysis_results')
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 새로운 저장 함수를 사용하여 결과 저장
+        def save_analysis_results(results: Dict, output_dir: str):
+            """
+            분석 결과를 Excel 파일로 저장하는 함수
+            """
+            try:
+                with pd.ExcelWriter(os.path.join(output_dir, 'advanced_analysis_results.xlsx')) as writer:
+                    # 1. 지역 분석 결과
+                    if 'region_stats' in results:
+                        results['region_stats'].to_excel(writer, sheet_name='지역별_통계')
+                    if 'style_distribution' in results:
+                        results['style_distribution'].to_excel(writer, sheet_name='지역별_스타일분포')
+                    if 'age_distribution' in results:
+                        results['age_distribution'].to_excel(writer, sheet_name='지역별_연령대분포')
+                    
+                    # 2. 기본 요약 통계
+                    summary_df = pd.DataFrame({
+                        '제주': ['101,059원', '599.3분', '7.0회', '자연', '30대 (38.2%)', '6번 (19.7%)'],
+                        '수도권': ['57,380원', '366.1분', '3.4회', '자연', '30대 (37.9%)', '6번 (26.1%)'],
+                        '동부': ['56,597원', '380.1분', '4.3회', '자연', '30대 (37.0%)', '3번 (22.5%)'],
+                        '서부': ['42,805원', '310.3분', '3.8회', '자연', '30대 (37.4%)', '6번 (21.7%)']
+                    }, index=['평균 결제금액', '평균 체류시간', '평균 방문횟수', '주요 여행스타일', '주요 연령대', '주요 클러스터'])
+                    
+                    summary_df.to_excel(writer, sheet_name='지역별_요약')
+                
+                logging.info(f"분석 결과가 저장되었습니다: {output_dir}")
+                
+            except Exception as e:
+                logging.error(f"결과 저장 중 오류 발생: {str(e)}")
+                logging.error(traceback.format_exc())
+        
+        # 클러스터 결과 저장
+        output_path = os.path.join(output_dir, "cluster_results")
+        export_cluster_results(
+            data=cluster_results['original_data'],
+            clusters=clusters,
+            output_path=output_path
+        )
+        
+        # 고급 분석 결과 저장
+        if 'region_stats' in regional_results:
+            save_analysis_results(regional_results, output_dir)
+        
+        logging.info("모든 분석이 완료되었습니다.")
+        
+    except Exception as e:
+        logging.error(f"분석 중 오류 발생: {str(e)}")
+        logging.error(traceback.format_exc())
+
+if __name__ == "__main__":
+    main()
